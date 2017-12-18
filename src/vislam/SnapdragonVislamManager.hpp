@@ -30,6 +30,7 @@
  *
  ****************************************************************************/
 #pragma once
+#include <queue>
 #include <mutex>
 #include <atomic>         // std::atomic
 #include <time.h>         // clock_gettime
@@ -43,7 +44,15 @@
 
 namespace Snapdragon {
   class VislamManager;
+  struct CameraImage;
 }
+
+struct Snapdragon::CameraImage{
+  int64_t frame_id;
+  uint8_t* image_buffer;
+  size_t buffer_size;
+  int64_t frame_ts_ns;
+};
 
 /**
  * Class to wrap the mvVISLAM SDK with Camera and IMU Samples.
@@ -160,6 +169,8 @@ public:
    */
   virtual ~VislamManager();
 
+  int32_t getNextCameraImage();
+
 private:
   void ImuCallback(const sensor_msgs::Imu::ConstPtr& msg);
 
@@ -172,10 +183,13 @@ private:
   bool                          verbose_;
   Snapdragon::CameraManager*    cam_man_ptr_;
   mvVISLAM*                     vislam_ptr_;
+  std::thread                   camera_update_thread_;
   std::mutex                    sync_mutex_;
+  std::mutex                    camera_buf_mutex_;
   uint8_t*                      image_buffer_;
   size_t                        image_buffer_size_bytes_;
-
+  int64_t last_imu_timestamp_ns_ = 0;
+  std::queue<CameraImage> camera_buffer_;
   ros::NodeHandle nh_;
   ros::Subscriber imu_sub_;
 };

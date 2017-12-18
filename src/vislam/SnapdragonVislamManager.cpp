@@ -47,18 +47,14 @@ Snapdragon::VislamManager::~VislamManager() {
 void Snapdragon::VislamManager::ImuCallback(
     const sensor_msgs::Imu::ConstPtr& msg)
 {
-  // Convert from ENU (mavros) to NED (vislam expectation) frame
-  sensor_msgs::Imu msg_ned = *msg;
-
   int64_t current_timestamp_ns = msg->header.stamp.toNSec();
 
-  static int64_t last_timestamp = 0;
   float delta = 0.f;
 
   // Sanity check on IMU timestamp
-  if (last_timestamp != 0)
+  if (last_imu_timestamp_ns_ != 0)
   {
-    delta = (current_timestamp_ns - last_timestamp) * 1e-6;
+    delta = (current_timestamp_ns - last_imu_timestamp_ns_) * 1e-6;
     const float imu_sample_dt_reasonable_threshold_ms = 2.5;
     if (delta > imu_sample_dt_reasonable_threshold_ms)
     {
@@ -69,13 +65,13 @@ void Snapdragon::VislamManager::ImuCallback(
       }
     }
   }
-  last_timestamp = current_timestamp_ns;
+  last_imu_timestamp_ns_ = current_timestamp_ns;
 
-  ROS_INFO_STREAM_THROTTLE(1, "IMU timestamp [ns]: \t" << last_timestamp);
+  ROS_INFO_STREAM_THROTTLE(1, "IMU timestamp [ns]: \t" << last_imu_timestamp_ns_);
 
   // Parse IMU message
   float lin_acc[3], ang_vel[3];
-  
+
   // Convert ENU to NED coordinates
   lin_acc[0] = msg->linear_acceleration.x;
   lin_acc[1] = msg->linear_acceleration.y;
@@ -205,6 +201,8 @@ int32_t Snapdragon::VislamManager::Start() {
     ERROR_PRINT( "Calling Start without calling intialize" );
     rc = -1;
   }
+
+  camera_update_thread_ = std::thread( &Snapdragon::VislamManager::getNextCameraImage, this);
   return rc;
 }
 
@@ -213,6 +211,10 @@ int32_t Snapdragon::VislamManager::Stop() {
 
   // Unsubscribe from IMU topic
   imu_sub_.shutdown();
+
+  if(camera_update_thread_.joinable()) {
+    camera_update_thread_.join();
+  }
   return 0;
 }
 
@@ -227,56 +229,92 @@ bool Snapdragon::VislamManager::HasUpdatedPointCloud() {
   return (mv_ret != 0 );
 }
 
+int32_t Snapdragon::VislamManager::getNextCameraImage(){
+  while(true){
+    // ROS_INFO("getNextCameraImage() running");
+    int32_t rc = 0;
+    CameraImage camera_image;
+    int64_t frame_id;
+    static int64_t prev_frame_id = 0;
+    uint32_t used = 0;
+    uint64_t frame_ts_ns;
+
+    rc = cam_man_ptr_->GetNextImageData( &frame_id, &frame_ts_ns, image_buffer_, image_buffer_size_bytes_ , &used );
+
+    if( rc != 0 ) {
+      WARN_PRINT( "Error Getting the image from camera" );
+    }else{
+      if( prev_frame_id != 0 && (prev_frame_id + 1 != frame_id ) ) {
+        WARN_PRINT( "Warning: Missed/Dropped Camera Frames.  recvd(%lld) expected(%lld)", frame_id, (prev_frame_id+1) );
+      }
+
+      // adjust the frame-timestamp for VISLAM at it needs the time at the center of the exposure and not the sof.
+      // Correction from exposure time
+      float correction = 1e3 * (cam_man_ptr_->GetExposureTimeUs()/2.f);
+
+      // Adjust timestamp with clock offset MONOTONIC <-> REALTIME:
+      // Camera images will correctly have REALTIME timestamps, IMU messages
+      // however carry the MONOTONIC timestamp.
+      timespec mono_time, wall_time;
+      if (clock_gettime(CLOCK_MONOTONIC, &mono_time) ||
+          clock_gettime(CLOCK_REALTIME, &wall_time))
+      {
+        ERROR_PRINT("Cannot access clock time");
+        continue;
+      }
+      // TODO: Perhaps filter clock_offset_ns. So far I only observed jumps of 1 milisecond though.
+      int64_t clock_offset_ns = (wall_time.tv_sec - mono_time.tv_sec) * 1e9 +
+                                 wall_time.tv_nsec - mono_time.tv_nsec;
+      uint64_t modified_timestamp_ns = frame_ts_ns - static_cast<uint64_t>(correction) + clock_offset_ns;
+
+      camera_image.frame_id = frame_id;
+      camera_image.image_buffer = new uint8_t[image_buffer_size_bytes_];
+      std::memcpy(camera_image.image_buffer, image_buffer_, image_buffer_size_bytes_);
+      camera_image.buffer_size = image_buffer_size_bytes_;
+      camera_image.frame_ts_ns = modified_timestamp_ns;
+
+      std::lock_guard<std::mutex> buffer_lock(camera_buf_mutex_);
+      camera_buffer_.push(camera_image);
+    }
+  }
+  return 0;
+}
+
 int32_t Snapdragon::VislamManager::GetPose( mvVISLAMPose& pose, int64_t& pose_frame_id, uint64_t& timestamp_ns ) {
-  int32_t rc = 0;
-  if( !initialized_ ) {
-    WARN_PRINT( "VislamManager not initialize" );
-    return -1;
-  }
+  ros::Time start_time = ros::Time::now();
 
-  // first set the Image from the camera.
-  // Next add it to the mvVISLAM
-  // Then call the API to get the Pose.
-  int64_t frame_id;
-  uint32_t used = 0;
-  uint64_t frame_ts_ns;
-  static int64_t prev_frame_id = 0;
-  rc = cam_man_ptr_->GetNextImageData( &frame_id, &frame_ts_ns, image_buffer_, image_buffer_size_bytes_ , &used );
-
-  if( rc != 0 ) {
-    WARN_PRINT( "Error Getting the image from camera" );
-  }
-  else {
-    if( prev_frame_id != 0 && (prev_frame_id + 1 != frame_id ) ) {
-      WARN_PRINT( "Warning: Missed/Dropped Camera Frames.  recvd(%lld) expected(%lld)", frame_id, (prev_frame_id+1) );
-    }
-
-    // adjust the frame-timestamp for VISLAM at it needs the time at the center of the exposure and not the sof.
-    // Correction from exposure time
-    float correction = 1e3 * (cam_man_ptr_->GetExposureTimeUs()/2.f);
-
-    // Adjust timestamp with clock offset MONOTONIC <-> REALTIME:
-    // Camera images will correctly have REALTIME timestamps, IMU messages
-    // however carry the MONOTONIC timestamp.
-    timespec mono_time, wall_time;
-    if (clock_gettime(CLOCK_MONOTONIC, &mono_time) ||
-        clock_gettime(CLOCK_REALTIME, &wall_time))
+  while(true){
+    // Wait for data in camera buffer
     {
-      ERROR_PRINT("Cannot access clock time");
-      return -1;
+      std::lock_guard<std::mutex> buffer_lock(camera_buf_mutex_);
+      if(!camera_buffer_.empty())
+      {
+        break;
+      }
     }
-    // TODO: Perhaps filter clock_offset_ns. So far I only observed jumps of 1 milisecond though.
-    int64_t clock_offset_ns = (wall_time.tv_sec - mono_time.tv_sec) * 1e9 +
-                               wall_time.tv_nsec - mono_time.tv_nsec;
-    uint64_t modified_timestamp = frame_ts_ns - static_cast<uint64_t>(correction) + clock_offset_ns;
-    {
-      std::lock_guard<std::mutex> lock( sync_mutex_ );
-      mvVISLAM_AddImage(vislam_ptr_, modified_timestamp, image_buffer_ );
-      pose = mvVISLAM_GetPose(vislam_ptr_);
-      pose_frame_id = frame_id;
-      timestamp_ns = static_cast<uint64_t>(modified_timestamp);
-      ROS_INFO_STREAM_THROTTLE(1, "Image timestamp [ns]: \t" << modified_timestamp);
-    }
+    usleep(500);
   }
-  return rc;
+
+  while(true){
+    {
+      std::lock_guard<std::mutex> buffer_lock(camera_buf_mutex_);
+      if (last_imu_timestamp_ns_>camera_buffer_.front().frame_ts_ns){
+        break;
+      }
+    }
+    usleep(500);
+  }
+
+  // ROS_INFO("Waited for %lld", (ros::Time::now()-start_time).toNSec());
+  {
+    std::lock_guard<std::mutex> lock( sync_mutex_ );
+    std::lock_guard<std::mutex> buffer_lock(camera_buf_mutex_);
+    mvVISLAM_AddImage(vislam_ptr_, camera_buffer_.front().frame_ts_ns, camera_buffer_.front().image_buffer);
+    pose = mvVISLAM_GetPose(vislam_ptr_);
+    pose_frame_id = camera_buffer_.front().frame_id;
+    timestamp_ns = static_cast<uint64_t>(camera_buffer_.front().frame_ts_ns);
+    ROS_INFO_STREAM_THROTTLE(1, "Image timestamp [ns]: \t" << timestamp_ns);
+    camera_buffer_.pop();
+  }
+  return 0;
 }

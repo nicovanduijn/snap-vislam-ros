@@ -94,6 +94,7 @@ private:
   // class methods
   int32_t PublishVislamData(mvVISLAMPose& vislamPose, int64_t vislamFrameId,
                             uint64_t timestamp_ns);
+  
   void ThreadMain();
 
   // data members;
